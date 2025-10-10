@@ -8,3 +8,28 @@
 - The server saves the received file in the "uploads" subdirectory of its current directory. The filename matches the name sent by the client. The server never write outside the "uploads" directory.
 - While receiving data from a client, the server  display the instantaneous reception rate and the average rate for the session in the console every 3 seconds. Rates are displayed separately for each active client. If a client has been active for less than 3 seconds, the rate still be displayed for it once. Rate here refers to the number of bytes transferred per unit of time.
 
+## Usage
+
+### Start server
+
+```
+go run main.go "port" "network interface"
+```
+
+Example 
+
+```
+go run main.go "9000" "en0"
+```
+
+### Start client
+
+```
+go run main.go "ip:port" "file path"
+```
+
+Example
+
+```
+go run main.go "192.168.0.104:9000" "main.go"
+```
