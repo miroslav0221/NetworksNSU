@@ -14,7 +14,8 @@ Everything found is shown to the user.
 
 ## API Methods:
 
-1. Getting locations with coordinates and names[https://docs.graphhopper.com/#operation/getGeocode]
+1. [Getting locations with coordinates and names](https://docs.graphhopper.com/#operation/getGeocode)
 2. Getting weather by coordinates[https://openweathermap.org/current]
 3. Getting a list of interesting places by coordinates[https://dev.opentripmap.org/docs#/Objects%20list/getListOfPlacesByRadius]
 4. Getting a place description by its id[https://dev.opentripmap.org/docs#/Object%20properties/getPlaceByXid]
+
