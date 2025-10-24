@@ -3,6 +3,7 @@ package ServerTCP
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -145,12 +147,23 @@ func (s *Server) receiveFileInfo(conn net.Conn) (*FileInfo, error) {
 		return nil, fmt.Errorf("не удалось прочитать имя файла: %v", err)
 	}
 
+	if !utf8.Valid(nameBuf) {
+		fmt.Println("Не utf-8")
+		return nil, errors.New("ошибка кодировки")
+	}
+
 	filename := string(bytes.TrimRight(nameBuf, "\x00"))
 
 	fmt.Printf("📄 Имя файла: %s\n", filename)
 
 	sizeBuf := make([]byte, sizeint64)
 	_, err = io.ReadFull(conn, sizeBuf)
+
+	if !utf8.Valid(nameBuf) {
+		fmt.Println("Не utf-8")
+		return nil, errors.New("ошибка кодировки")
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("не удалось прочитать размер файла: %v", err)
 	}
