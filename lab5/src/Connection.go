@@ -11,11 +11,9 @@ const (
 type Conn struct {
     fd     int     
     rfd    int     
-    // state  ConnState
 	state  State
-    inBuf  []byte  
-    outBuf []byte   
-
+    domain string
     host string
     port uint16
+    resolving bool
 }

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"time"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -20,10 +20,36 @@ const (
 	FIVE  = 0x05
 )
 
+const (
+	MIN_COUNT_AUTH = 1
+	MIN_LEN_REQUEST = 7
+	MIN_LEN_REQ_DOMAIN = 10
+
+	START_BYTE_IP = 4
+	FINISH_BYTE_IP = 8
+
+	START_BYTE_PORT = 8
+	FINISH_BYTE_PORT = 10
+
+	INDEX_LEN_DOMAIN = 4
+
+	START_DOMAIN_BYTE = 5
+	PORT_LEN = 2
+)
+
+const (
+	localhost   = "127.0.0.1"
+	countClient = 128
+	bufsize     = 65536
+)
+
+
 type Server struct {
 	listenFD    int
 	selecter    int
+	IP          string
 	connections map[int]*Conn
+	mu          sync.Mutex
 }
 
 func NewServer() *Server {
@@ -62,12 +88,13 @@ func getInterface(name string) (string, error) {
 func (s *Server) InitSocket(port int) {
 	ifaceIP, err := getInterface("en0")
 	if err != nil {
-		fmt.Printf("getInterface failed: %v; falling back to 0.0.0.0\n", err)
-		ifaceIP = "0.0.0.0"
+		fmt.Printf("getInterface failed: %v; falling back to localhost\n", err)
+		ifaceIP = localhost
 	}
 
 	s.listenFD, err = unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
+		fmt.Println("Failed init tcp socket")
 		panic(err)
 	}
 
@@ -75,10 +102,7 @@ func (s *Server) InitSocket(port int) {
 
 	ip := net.ParseIP(ifaceIP)
 	if ip == nil {
-		if ifaceIP == "0.0.0.0" {
-		} else {
-			panic(fmt.Errorf("invalid IP address: %s", ifaceIP))
-		}
+		panic(fmt.Errorf("invalid IP address: %s", ifaceIP))
 	} else {
 		ip4 := ip.To4()
 		if ip4 == nil {
@@ -87,16 +111,28 @@ func (s *Server) InitSocket(port int) {
 		copy(addr.Addr[:], ip4)
 	}
 
-	if err := unix.Bind(s.listenFD, addr); err != nil {
+
+	err = unix.SetsockoptInt(s.listenFD, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+
+	 if err != nil {
+        unix.Close(s.listenFD)
+        panic(err)
+    }
+
+	if err = unix.Bind(s.listenFD, addr); err != nil {
 		fmt.Println("Failed bind")
 		panic(err)
 	}
-	if err := unix.Listen(s.listenFD, 128); err != nil {
+
+	if err = unix.Listen(s.listenFD, countClient); err != nil {
 		panic(err)
 	}
-	if err := unix.SetNonblock(s.listenFD, true); err != nil {
+
+	if err = unix.SetNonblock(s.listenFD, true); err != nil {
 		panic(err)
 	}
+
+	s.IP = ifaceIP
 	fmt.Printf("Listening on %s:%d\n", ifaceIP, port)
 }
 
@@ -110,96 +146,136 @@ func (s *Server) InitSelecter() {
 	change := unix.Kevent_t{
 		Ident:  uint64(s.listenFD),
 		Filter: unix.EVFILT_READ,
-		Flags:  unix.EV_ADD,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR,
 	}
 	if _, err := unix.Kevent(s.selecter, []unix.Kevent_t{change}, nil, nil); err != nil {
 		panic(err)
 	}
 }
 
+func (s *Server) newConnection(listenFD int) error {
+	connFD, _, err := unix.Accept(listenFD)
+	if err != nil {
+		return err
+	}
+	_ = unix.SetNonblock(connFD, true)
+
+	change := unix.Kevent_t{
+		Ident:  uint64(connFD),
+		Filter: unix.EVFILT_READ,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR,
+	}
+	unix.Kevent(s.selecter, []unix.Kevent_t{change}, nil, nil)
+
+	c := &Conn{
+		fd:       connFD,
+		state:    StateHello,
+		rfd:      0,
+		host:     "",
+		domain:   "",
+		resolving: false,
+	}
+
+	s.mu.Lock()
+	s.connections[connFD] = c
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Server) readFD(fd int, conn *Conn) ([]byte, error, int) {
+	buf := make([]byte, bufsize)
+	n, err := unix.Read(fd, buf)
+	if n == 0 || (err != nil && errors.Is(err, unix.ECONNRESET)) {
+		s.closeConn(conn)
+		return nil, err, 0
+	}
+	if err != nil {
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, err, 0
+		}
+		s.closeConn(conn)
+		return nil, err, 0
+	}
+	return buf, nil, n
+}
+
+func (s *Server) handleRequest(fd int, conn *Conn, buf []byte, n int) error {
+	if conn.state == StateHello {
+		s.processHello(fd, buf[:n])
+		conn.state = StateRequest
+		s.mu.Lock()
+		s.connections[fd] = conn
+		s.mu.Unlock()
+	} else if conn.state == StateRequest {
+		s.processRequest(conn, buf[:n])
+		s.connectToHost(conn)
+		s.mu.Lock()
+		s.connections[fd] = conn
+		s.mu.Unlock()
+	} else if conn.state == StateProxy {
+		if fd == conn.fd {
+			if conn.rfd <= 0 {
+				return errors.New("remote fd <= 0")
+			}
+			if err := writeFull(conn.rfd, buf[:n]); err != nil {
+				s.closeConn(conn)
+			}
+		} else if conn.rfd == fd {
+			if conn.fd <= 0 {
+				return errors.New("client fd <= 0")
+			}
+			if err := writeFull(conn.fd, buf[:n]); err != nil {
+				s.closeConn(conn)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) WaitEvents() {
-	events := make([]unix.Kevent_t, 128)
+	events := make([]unix.Kevent_t, countClient)
 	for {
-		n, err := unix.Kevent(s.selecter, nil, events, nil)
+		count, err := unix.Kevent(s.selecter, nil, events, nil)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
 			}
 			panic(err)
 		}
-		for i := 0; i < n; i++ {
+		for i := 0; i < count; i++ {
 			fd := int(events[i].Ident)
 			filter := events[i].Filter
 
 			if fd == s.listenFD && filter == unix.EVFILT_READ {
-				connFD, _, err := unix.Accept(fd)
-				if err != nil {
-					continue
-				}
-				_ = unix.SetNonblock(connFD, true)
+				_ = s.newConnection(fd)
+				continue
+			}
 
-				change := unix.Kevent_t{
-					Ident:  uint64(connFD),
-					Filter: unix.EVFILT_READ,
-					Flags:  unix.EV_ADD,
-				}
-				unix.Kevent(s.selecter, []unix.Kevent_t{change}, nil, nil)
-
-				s.connections[connFD] = &Conn{
-					fd:    connFD,
-					state: StateHello,
-					rfd:   0,
-				}
-
-			} else if filter == unix.EVFILT_READ {
+			if filter == unix.EVFILT_READ {
+				s.mu.Lock()
 				conn, ok := s.connections[fd]
+				s.mu.Unlock()
 				if !ok {
 					unix.Close(fd)
 					continue
 				}
 
-				buf := make([]byte, 65536)
-				nn, err := unix.Read(fd, buf)
-				if nn == 0 || (err != nil && errors.Is(err, unix.ECONNRESET)) {
-					s.closeConn(conn)
-					continue
-				}
+				buf, err, n := s.readFD(fd, conn)
 				if err != nil {
 					if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
 						continue
 					}
-					s.closeConn(conn)
+					continue
+				}
+				if n == 0 || buf == nil {
 					continue
 				}
 
-				if conn.state == StateHello {
-					s.processHello(fd, buf[:nn])
-					conn.state = StateRequest
-					s.connections[fd] = conn
-				} else if conn.state == StateRequest {
-					s.processRequest(conn, buf[:nn])
-					s.connectToHost(conn)
-					s.connections[fd] = conn
-				} else if conn.state == StateProxy {
-					if conn.fd == fd {
-						if conn.rfd <= 0 {
-							continue
-						}
-						if err := writeFull(conn.rfd, buf[:nn]); err != nil {
-							s.closeConn(conn)
-						}
-					} else if conn.rfd == fd {
-						if conn.fd <= 0 {
-							continue
-						}
-						if err := writeFull(conn.fd, buf[:nn]); err != nil {
-							s.closeConn(conn)
-						}
-					}
-				}
-
+				_ = s.handleRequest(fd, conn, buf, n)
 			} else if filter == unix.EVFILT_WRITE {
+				s.mu.Lock()
 				conn, ok := s.connections[fd]
+				s.mu.Unlock()
 				if !ok {
 					continue
 				}
@@ -210,17 +286,20 @@ func (s *Server) WaitEvents() {
 						continue
 					}
 
-					s.answerHello(ZERO, conn.fd, nil, 0, nil)
-
+					s.answerHello(ZERO, conn.fd, nil, 0, "")
 					conn.state = StateProxy
-					s.connections[fd] = conn
 
 					change := unix.Kevent_t{
 						Ident:  uint64(conn.rfd),
 						Filter: unix.EVFILT_READ,
-						Flags:  unix.EV_ADD,
+						Flags:  unix.EV_ADD | unix.EV_CLEAR,
 					}
 					unix.Kevent(s.selecter, []unix.Kevent_t{change}, nil, nil)
+
+					s.mu.Lock()
+					s.connections[conn.rfd] = conn
+					s.connections[conn.fd] = conn
+					s.mu.Unlock()
 
 					fmt.Printf("Connected to host %s:%d\n", conn.host, conn.port)
 				}
@@ -236,6 +315,7 @@ func (s *Server) Close() {
 	if s.selecter > 0 {
 		unix.Close(s.selecter)
 	}
+	s.mu.Lock()
 	for _, c := range s.connections {
 		if c != nil {
 			if c.fd > 0 {
@@ -246,39 +326,20 @@ func (s *Server) Close() {
 			}
 		}
 	}
+	s.mu.Unlock()
 }
 
-func (s *Server) answerHello(answer byte, fd int, ip *net.IP, port uint16, domain *string) {
+func (s *Server) answerHello(answer byte, fd int, ip net.IP, port uint16, domain string) {
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, byte(FIVE))
-	binary.Write(&buf, binary.BigEndian, answer)
-	binary.Write(&buf, binary.BigEndian, byte(0)) // RSV
-
-	if ip != nil {
-		binary.Write(&buf, binary.BigEndian, byte(ONE))
-		ip4 := (*ip).To4()
-		if ip4 == nil {
-			ip4 = net.IPv4(0, 0, 0, 0).To4()
-		}
-		buf.Write(ip4)
-	} else if domain != nil {
-		binary.Write(&buf, binary.BigEndian, byte(THREE))
-		binary.Write(&buf, binary.BigEndian, byte(len(*domain)))
-		buf.Write([]byte(*domain))
-	} else {
-		binary.Write(&buf, binary.BigEndian, byte(ONE))
-		buf.Write([]byte{0, 0, 0, 0})
-	}
-
-	binary.Write(&buf, binary.BigEndian, port)
+	buf.Write([]byte{byte(FIVE), answer, ZERO})
+	buf.WriteByte(byte(ONE))
+	buf.Write([]byte{0, 0, 0, 0})
+	binary.Write(&buf, binary.BigEndian, uint16(0))
 	_, _ = unix.Write(fd, buf.Bytes())
 }
 
 func (s *Server) processRequest(conn *Conn, data []byte) {
-	var port uint16
-	var domain string
-
-	if len(data) == 0 || len(data) < 7 {
+	if len(data) == 0 || len(data) < MIN_LEN_REQUEST {
 		fmt.Println("len client message = 0")
 		return
 	}
@@ -304,12 +365,12 @@ func (s *Server) processRequest(conn *Conn, data []byte) {
 	}
 
 	if data[3] == ONE {
-		if len(data) < 10 {
+		if len(data) < MIN_LEN_REQ_DOMAIN {
 			fmt.Println("invalid IPv4 request length")
 			return
 		}
-		ip := net.IP(data[4:8])
-		port = binary.BigEndian.Uint16(data[8:10])
+		ip := net.IP(data[START_BYTE_IP:FINISH_BYTE_IP])
+		port := binary.BigEndian.Uint16(data[START_BYTE_PORT:FINISH_BYTE_PORT])
 		conn.host = ip.String()
 		conn.port = port
 		fmt.Printf("IP: %s\n", ip.String())
@@ -317,16 +378,17 @@ func (s *Server) processRequest(conn *Conn, data []byte) {
 	}
 
 	if data[3] == THREE {
-		domainLen := int(data[4])
-		if 5+domainLen+2 > len(data) {
+		domainLen := int(data[INDEX_LEN_DOMAIN])
+		if MIN_LEN_REQUEST + domainLen > len(data) {
 			fmt.Println("invalid domain request length")
 			return
 		}
-		domain = string(data[5 : 5+domainLen])
-		fmt.Printf("Domain: %s\n", domain)
-		port = binary.BigEndian.Uint16(data[5+domainLen : 5+domainLen+2])
-		conn.host = domain
+		domain := string(data[START_DOMAIN_BYTE : START_DOMAIN_BYTE + domainLen])
+		port := binary.BigEndian.Uint16(data[START_DOMAIN_BYTE + domainLen : START_DOMAIN_BYTE + domainLen + PORT_LEN])
+		conn.domain = domain
+		conn.host = domain 
 		conn.port = port
+		fmt.Printf("Domain: %s\n", domain)
 		fmt.Printf("Port: %v\n", port)
 	}
 }
@@ -336,28 +398,67 @@ func (s *Server) processHello(fd int, data []byte) {
 		fmt.Println("len client message = 0")
 		return
 	}
-
 	if data[0] != FIVE {
 		fmt.Println("Version SOCKS != 5")
 		return
 	}
-
 	if int(data[1]) < 1 {
 		fmt.Println("No auth methods")
 		return
 	}
 
 	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, byte(FIVE))
-	binary.Write(&buf, binary.BigEndian, byte(ZERO)) 
-
+	buf.Write([]byte{byte(FIVE), byte(ZERO)})
 	_, _ = unix.Write(fd, buf.Bytes())
 }
 
-func (s *Server) connectToHost(conn *Conn) {
-	if conn.rfd > 0 {
+
+func (s *Server) queryDNS(conn *Conn) {
+	s.mu.Lock()
+	if conn.resolving {
+		s.mu.Unlock()
 		return
 	}
+	conn.resolving = true
+	s.mu.Unlock()
+
+	go func() {
+		addrs, err := net.LookupIP(conn.host)
+		s.mu.Lock()
+
+		current, ok := s.connections[conn.fd]
+		if !ok || current != conn {
+			return
+		}
+
+		conn.resolving = false
+
+		if err != nil || len(addrs) == 0 {
+			fmt.Printf("Failed to resolve host %s: %v\n", conn.host, err)
+			if conn.rfd > 0 {
+				unix.Close(conn.rfd)
+				delete(s.connections, conn.rfd)
+				conn.rfd = 0
+			}
+			s.closeConn(conn)
+			return
+		}
+
+		ip := addrs[0]
+		conn.host = ip.String()
+
+		s.mu.Unlock()
+		s.connectToHost(conn)
+	}()
+}
+
+func (s *Server) connectToHost(conn *Conn) {
+	s.mu.Lock()
+	if conn.rfd > 0 || conn.state == StateConnecting || conn.state == StateProxy {
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
 
 	rfd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -367,20 +468,18 @@ func (s *Server) connectToHost(conn *Conn) {
 
 	ip := net.ParseIP(conn.host)
 	if ip == nil {
-		addrs, err := net.LookupIP(conn.host)
-		if err != nil || len(addrs) == 0 {
-			fmt.Printf("Failed to resolve host: %v\n", err)
-			unix.Close(rfd)
-			return
-		}
-		ip = addrs[0]
+		s.queryDNS(conn)
+		unix.Close(rfd)
+		return
 	}
+
 	ipv4 := ip.To4()
 	if ipv4 == nil {
 		fmt.Printf("Not an IPv4 address: %s\n", conn.host)
 		unix.Close(rfd)
 		return
 	}
+
 	addr := &unix.SockaddrInet4{Port: int(conn.port)}
 	copy(addr.Addr[:], ipv4)
 	err = unix.Connect(rfd, addr)
@@ -388,46 +487,47 @@ func (s *Server) connectToHost(conn *Conn) {
 		unix.Close(rfd)
 		return
 	}
-	conn.rfd = rfd
-	conn.state = StateConnecting
 
 	change := unix.Kevent_t{
 		Ident:  uint64(rfd),
 		Filter: unix.EVFILT_WRITE,
-		Flags:  unix.EV_ADD,
+		Flags:  unix.EV_ADD | unix.EV_CLEAR,
 	}
 	unix.Kevent(s.selecter, []unix.Kevent_t{change}, nil, nil)
 
+	s.mu.Lock()
+	conn.rfd = rfd
+	conn.state = StateConnecting
 	s.connections[rfd] = conn
+	s.connections[conn.fd] = conn
+	s.mu.Unlock()
 }
 
-func (s *Server) closeConn(c *Conn) {
-	if c == nil {
+func (s *Server) closeConn(conn *Conn) {
+	if conn == nil {
 		return
 	}
-	if c.fd > 0 {
-		unix.Close(c.fd)
-		delete(s.connections, c.fd)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if conn.fd > 0 {
+		unix.Close(conn.fd)
+		delete(s.connections, conn.fd)
 	}
-	if c.rfd > 0 {
-		unix.Close(c.rfd)
-		delete(s.connections, c.rfd)
+	if conn.rfd > 0 {
+		unix.Close(conn.rfd)
+		delete(s.connections, conn.rfd)
 	}
 }
 
-func writeFull(fd int, b []byte) error {
+func writeFull(fd int, buf []byte) error {
 	off := 0
-	for off < len(b) {
-		n, err := unix.Write(fd, b[off:])
+	for off < len(buf) {
+		n, err := unix.Write(fd, buf[off:])
 		if n > 0 {
 			off += n
 			continue
 		}
 		if err != nil {
-			if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
-				time.Sleep(5 * time.Millisecond)
-				continue
-			}
 			return err
 		}
 		return fmt.Errorf("write returned 0")
