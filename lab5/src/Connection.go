@@ -1,5 +1,8 @@
 package src
 
+import "sync"
+
+
 type State int
 const (
     StateHello State = iota
@@ -8,12 +11,20 @@ const (
     StateProxy
 )
 
+
 type Conn struct {
-    fd     int     
-    rfd    int     
-	state  State
-    domain string
-    host string
-    port uint16
-    resolving bool
+    mu               sync.Mutex
+    fd               int
+    rfd              int
+    state            State
+    host             string
+    domain           string
+    port             uint16
+    resolving        bool
+    writeBufToRemote []byte 
+    writeBufToClient []byte
+    bytesToRemote    uint64 
+    bytesToClient    uint64 
 }
+
+
