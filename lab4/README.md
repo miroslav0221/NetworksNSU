@@ -22,5 +22,6 @@
 ## Usage
 
 ```
-go run cmd/main.go "port"
+go run cmd/main.go
 ```
+
